@@ -14,6 +14,7 @@ import threading
 import time
 from collections import defaultdict
 from typing import Dict, List, Optional
+import torch
 
 from kvcached.locks import NoOpLock
 from kvcached.page_allocator import Page, PageAllocator
@@ -152,6 +153,22 @@ class KVCacheManager:
         return self._alloc(need_size)
 
     @synchronized
+    def maybe_apply_resize_target(self) -> bool:
+        """Apply the external resize target, if any.
+
+        This is used by the SGLang integration to ensure the resize decision is
+        applied *before* SGLang's eviction logic runs, so eviction sees the
+        post-resize capacity.
+        """
+        self._wait_post_init()
+        new_mem_size = self.page_allocator.mem_info_tracker.check_and_get_resize_target(
+            self.mem_size, self.num_layers
+        )
+        if new_mem_size is None:
+            return False
+        return self._resize_locked(new_mem_size)
+
+    @synchronized
     def _alloc(self,
                need_size: int,
                _skip_wait: bool = False) -> Optional[List[int]]:
@@ -160,10 +177,18 @@ class KVCacheManager:
             # finished and then perform the usual capacity check.
             self._wait_post_init()
 
+        # Note: external shrinking is applied before SGLang eviction (via patches)
+        # to avoid shrinking *after* eviction, which can re-introduce OOM. Here we
+        # only auto-apply expansions (they are safe to do inside alloc).
         new_mem_size = self.page_allocator.mem_info_tracker.check_and_get_resize_target(
-            self.mem_size, self.num_layers)
-        if new_mem_size is not None:
-            self.resize(new_mem_size)
+            self.mem_size, self.num_layers
+        )
+        if new_mem_size is not None and new_mem_size > self.mem_size:
+            # Avoid nested lock acquisition by resizing under the current lock.
+            self._resize_locked(new_mem_size)
+        elif new_mem_size is not None and new_mem_size < self.mem_size:
+            self.in_shrink = True
+            self.free_reserved()
 
         if self.available_size() < need_size:
             logger.warning(f"available_size()={self.available_size()} < "
@@ -252,13 +277,16 @@ class KVCacheManager:
                 self.avail_pages[page_id] = page
 
         if pages_to_free:
+            logger.debug(f"Rank {torch.distributed.get_rank()} Freeing pages: {pages_to_free}")
             self.page_allocator.free_pages(pages_to_free)
 
         if self.in_shrink:
             assert self.target_num_blocks is not None
             if self._get_num_alloced_blocks() <= self.target_num_blocks:
-                self.page_allocator.resize(self.target_num_blocks *
-                                           self.block_mem_size)
+                new_mem_size = self.target_num_blocks * self.block_mem_size
+                self.page_allocator.resize(new_mem_size)
+                # Keep the current limit in sync with the allocator.
+                self.mem_size = new_mem_size
                 self.in_shrink = False
                 self.target_num_blocks = None
 
@@ -286,18 +314,54 @@ class KVCacheManager:
         Reset the limit of the K or V tensor in one layer.
         new_mem_size: the memory size of the K or V tensor in one layer
         """
+        return self._resize_locked(new_mem_size)
+
+    def _resize_locked(self, new_mem_size: int) -> bool:
         self._wait_post_init()
         assert new_mem_size > 0, "new_mem_size must be positive"
+
+        # If there are reserved blocks, free them proactively to reduce
+        # fragmentation and maximize the chance of shrinking successfully.
+        if self.reserved_blocks:
+            self.free_reserved()
+
         if self.page_allocator.resize(new_mem_size):
+            self.mem_size = new_mem_size
             if self.in_shrink:
                 self.in_shrink = False
                 self.target_num_blocks = None
-            return True  # Successfully resized.
-        # Failed to resize due to too many in-use blocks.
-        assert (len(self.reserved_blocks) == 0
-                ), "Reserved blocks must be freed before resizing."
-        # NOTE: we can support resizing with reserved blocks, but we want to
-        # enforce this check for now to ensure correctness.
+            return True
+
+        # If shrinking is blocked by in-use pages, try to evict radix cache
+        # entries (not participating in compute) to free whole physical pages.
+        target_num_pages = new_mem_size // self.page_allocator.page_size
+        num_inuse_pages = self.page_allocator.get_num_inuse_pages()
+        if target_num_pages < num_inuse_pages:
+            caches = list(getattr(self, "_kvcached_radix_caches", []))
+            if caches:
+                try:
+                    self._lock.release()
+                    for cache in caches:
+                        evict_fn = getattr(cache, "_kvcached_evict_pages_for_shrink", None)
+                        if evict_fn is None:
+                            continue
+                        try:
+                            evict_fn(target_num_pages)
+                        except Exception as e:
+                            logger.warning(
+                                f"Radix cache shrink eviction failed: {e}")
+                finally:
+                    self._lock.acquire()
+
+                if self.page_allocator.resize(new_mem_size):
+                    self.mem_size = new_mem_size
+                    if self.in_shrink:
+                        self.in_shrink = False
+                        self.target_num_blocks = None
+                    return True
+
+        # Still failed to resize due to too many in-use blocks; fall back to the
+        # existing deferred shrink mechanism.
         self.in_shrink = True
         self.target_num_blocks = new_mem_size // self.block_mem_size
         self.free_reserved()
