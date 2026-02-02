@@ -5,14 +5,15 @@ import argparse
 import atexit
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
 import time
-from typing import List, Optional, TypedDict
+from typing import List, Optional, Tuple, TypedDict
 
 from kvcached.cli.kvtop import _detect_kvcache_ipc_names, kvtop as kvtop_ui
-from kvcached.cli.utils import _format_size, get_kv_cache_limit, update_kv_cache_limit
+from kvcached.cli.utils import _format_size, delete_kv_cache_segment, get_kv_cache_limit, update_kv_cache_limit
 
 try:
     import readline  # type: ignore
@@ -60,8 +61,8 @@ def _clr(text: str, color: Optional[str] = None, *, bold: bool = False) -> str:
 
 
 COMMANDS = [
-    'list', 'limit', 'limit-percent', 'watch', 'kvtop', 'delete', 'help',
-    'exit', 'quit'
+    'list', 'limit', 'limit-percent', 'watch', 'kvtop', 'delete',
+    'cleanup-orphaned', 'help', 'exit', 'quit'
 ]
 
 # Nicely formatted help text for the interactive shell.
@@ -75,6 +76,7 @@ Available commands:
   !<shell cmd>                 Run command in system shell
   help                         Show this help message
   delete <ipc>                 Delete IPC segment and its limit entry
+  cleanup-orphaned             Delete orphaned IPC segments (from killed processes)
   exit | quit                  Exit the shell
 """
 
@@ -202,6 +204,96 @@ def _parse_size(size_str: str) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Orphaned IPC detection utilities
+# ---------------------------------------------------------------------------
+
+
+def _extract_pgid_from_ipc_name(ipc_name: str) -> Optional[int]:
+    """Extract process group ID (PGID) from IPC name.
+    
+    IPC names typically follow the pattern: kvcached_<Engine>_<PGID>
+    or kvcached_<Engine>_<PGID>_<suffix>
+    
+    Returns:
+        PGID if found, None otherwise
+    """
+    # Pattern: kvcached_<Engine>_<PGID> or kvcached_<Engine>_<PGID>_<suffix>
+    # Examples: kvcached_SGLang_10036, kvcached_vLLM_12345_1
+    pattern = r'kvcached_[^_]+_(\d+)(?:_\d+)?$'
+    match = re.match(pattern, ipc_name)
+    if match:
+        try:
+            return int(match.group(1))
+        except (ValueError, IndexError):
+            return None
+    return None
+
+
+def _is_process_group_alive(pgid: int) -> bool:
+    """Check if a process group with the given PGID exists.
+    
+    Returns:
+        True if the process group exists (has at least one process), False otherwise
+    """
+    # Use pgrep to check if any process belongs to this process group
+    try:
+        result = subprocess.run(
+            ['pgrep', '-g', str(pgid)],
+            capture_output=True,
+            text=True,
+            timeout=2
+        )
+        # pgrep returns 0 if processes found, 1 if not found
+        return result.returncode == 0 and bool(result.stdout.strip())
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        # Fallback: try using ps to find processes with this PGID
+        try:
+            result = subprocess.run(
+                ['ps', '-eo', 'pgid', '--no-headers'],
+                capture_output=True,
+                text=True,
+                timeout=2
+            )
+            if result.returncode == 0:
+                pgids = set(line.strip() for line in result.stdout.splitlines() if line.strip())
+                return str(pgid) in pgids
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            pass
+        # If both methods fail, assume process group doesn't exist
+        return False
+
+
+def _is_ipc_orphaned(ipc_name: str) -> bool:
+    """Check if an IPC segment is orphaned (process group no longer exists).
+    
+    Returns:
+        True if orphaned, False if active or cannot determine
+    """
+    pgid = _extract_pgid_from_ipc_name(ipc_name)
+    if pgid is None:
+        # Cannot determine PGID, assume not orphaned (might be custom named)
+        return False
+    return not _is_process_group_alive(pgid)
+
+
+def _get_orphaned_ipcs(ipcs: Optional[List[str]] = None) -> List[str]:
+    """Get list of orphaned IPC segment names.
+    
+    Args:
+        ipcs: Optional list of IPC names to check. If None, auto-detect all.
+        
+    Returns:
+        List of orphaned IPC segment names
+    """
+    names = ipcs or _detect_kvcache_ipc_names()
+    orphaned = []
+    for name in names:
+        if _is_ipc_orphaned(name):
+            orphaned.append(name)
+    return orphaned
+
+
+# ---------------------------------------------------------------------------
 # Core command implementations
 # ---------------------------------------------------------------------------
 
@@ -210,19 +302,22 @@ class _IpcStats(TypedDict):
     ipc: str
     limit_bytes: int
     used_bytes: int
+    is_orphaned: bool
 
 
-def cmd_list(ipcs: Optional[List[str]] = None, json_out: bool = False):
+def cmd_list(ipcs: Optional[List[str]] = None, json_out: bool = False, show_orphaned: bool = True):
     names = ipcs or _detect_kvcache_ipc_names()
     res: List[_IpcStats] = []
     for name in names:
         info = get_kv_cache_limit(name)
         if info is None:
             continue
+        is_orphaned = _is_ipc_orphaned(name) if show_orphaned else False
         res.append({
             'ipc': name,
             'limit_bytes': info.total_size,
             'used_bytes': info.used_size,
+            'is_orphaned': is_orphaned,
         })
 
     if json_out:
@@ -231,10 +326,12 @@ def cmd_list(ipcs: Optional[List[str]] = None, json_out: bool = False):
         if not res:
             print("No active KVCached segments found.")
             return
-        print(
-            _clr(f"{'IPC':24} {'Limit':>12} {'Used':>12} {'%':>6}",
-                 'cyan',
-                 bold=True))
+        # Header with orphaned status column if showing orphaned info
+        header = f"{'IPC':24} {'Limit':>12} {'Used':>12} {'%':>6}"
+        if show_orphaned:
+            header += f" {'Status':>10}"
+        print(_clr(header, 'cyan', bold=True))
+        
         for entry in res:
             lim = entry['limit_bytes']
             used = entry['used_bytes']
@@ -246,8 +343,17 @@ def cmd_list(ipcs: Optional[List[str]] = None, json_out: bool = False):
                 clr = 'yellow'
             else:
                 clr = 'red'
-
+            
+            # Mark orphaned entries
+            if entry.get('is_orphaned', False):
+                clr = 'red'  # Override color for orphaned
+                status = _clr('ORPHANED', 'red', bold=True)
+            else:
+                status = _clr('ACTIVE', 'green')
+            
             line = f"{entry['ipc']:<24} {_format_size(lim):>12} {_format_size(used):>12} {pct:5.1f} %"
+            if show_orphaned:
+                line += f" {status:>10}"
             print(_clr(line, clr))
 
 
@@ -309,12 +415,52 @@ def cmd_top(ipcs: Optional[List[str]] = None, refresh: float = 1.0):
 
 
 def cmd_delete(ipc: str):
-    from kvcached.cli.utils import delete_kv_cache_segment
-
     if delete_kv_cache_segment(ipc):
         print(_clr(f"Deleted IPC '{ipc}'.", 'green'))
     else:
         print(_clr(f"IPC '{ipc}' not found.", 'red', bold=True),
+              file=sys.stderr)
+
+
+def cmd_cleanup_orphaned(dry_run: bool = False):
+    """Delete all orphaned IPC segments (from killed processes).
+    
+    Args:
+        dry_run: If True, only show what would be deleted without actually deleting
+    """
+    orphaned = _get_orphaned_ipcs()
+    
+    if not orphaned:
+        print(_clr("No orphaned IPC segments found.", 'green'))
+        return
+    
+    if dry_run:
+        print(_clr(f"Would delete {len(orphaned)} orphaned IPC segment(s):", 'yellow', bold=True))
+        for ipc in orphaned:
+            info = get_kv_cache_limit(ipc)
+            if info:
+                print(f"  - {ipc} (Limit: {_format_size(info.total_size)}, Used: {_format_size(info.used_size)})")
+            else:
+                print(f"  - {ipc}")
+        return
+    
+    deleted_count = 0
+    failed_count = 0
+    
+    print(_clr(f"Found {len(orphaned)} orphaned IPC segment(s). Cleaning up...", 'yellow', bold=True))
+    for ipc in orphaned:
+        if delete_kv_cache_segment(ipc):
+            print(_clr(f"  ✓ Deleted '{ipc}'", 'green'))
+            deleted_count += 1
+        else:
+            print(_clr(f"  ✗ Failed to delete '{ipc}'", 'red'))
+            failed_count += 1
+    
+    print()
+    if deleted_count > 0:
+        print(_clr(f"Successfully deleted {deleted_count} orphaned segment(s).", 'green'))
+    if failed_count > 0:
+        print(_clr(f"Failed to delete {failed_count} segment(s).", 'red', bold=True),
               file=sys.stderr)
 
 
@@ -399,6 +545,9 @@ def interactive_shell():
                 cmd_top(ipcs_top if ipcs_top else None, refresh)
             elif cmd == 'delete' and len(tokens) == 2:
                 cmd_delete(tokens[1])
+            elif cmd == 'cleanup-orphaned':
+                dry_run = '--dry-run' in tokens or '-n' in tokens
+                cmd_cleanup_orphaned(dry_run=dry_run)
             else:
                 # Fallback to system shell
                 os.system(line)
@@ -454,6 +603,14 @@ def main():
     p_del = sub.add_parser('delete', help='Delete IPC segment')
     p_del.add_argument('ipc')
 
+    # cleanup-orphaned
+    p_cleanup = sub.add_parser('cleanup-orphaned',
+                                help='Delete orphaned IPC segments (from killed processes)')
+    p_cleanup.add_argument('-n',
+                           '--dry-run',
+                           action='store_true',
+                           help='Show what would be deleted without actually deleting')
+
     # shell
     sub.add_parser('shell', help='Start interactive shell')
 
@@ -471,6 +628,8 @@ def main():
         cmd_top(args.ipc if args.ipc else None, args.refresh)
     elif args.command == 'delete':
         cmd_delete(args.ipc)
+    elif args.command == 'cleanup-orphaned':
+        cmd_cleanup_orphaned(dry_run=args.dry_run)
     elif args.command == 'shell' or args.command is None:
         interactive_shell()
     else:
