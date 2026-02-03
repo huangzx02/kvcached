@@ -11,10 +11,9 @@ from kvcached.integration.sglang.patches import (
     SGLANG_ALL_RANGE,
     ElasticAllocatorPatch,
     ElasticMemoryPoolPatch,
-    RadixCacheShrinkEvictionPatch,
-    ResizeBeforeEvictPatch,
     SchedulerMemoryLeakPatch,
 )
+from kvcached.integration.sglang.radix_cache_patches import RadixCacheShrinkEvictionPatch
 from kvcached.integration.sglang.scheduler_patches import SchedulerShrinkRetractPatch
 from kvcached.utils import get_kvcached_logger
 
@@ -30,6 +29,7 @@ def _patch_sglang(_sglang: types.ModuleType) -> None:
     if not _env_enabled():
         logger.debug("Disabled by KVCACHED_AUTOPATCH")
         return
+    logger.debug("Patching SGLang")
 
     # Create patch manager and register version-specific SGLang patches
     patch_manager = PatchManager("sglang")
@@ -38,9 +38,8 @@ def _patch_sglang(_sglang: types.ModuleType) -> None:
         [
             (ElasticAllocatorPatch(), SGLANG_ALL_RANGE),
             (ElasticMemoryPoolPatch(), SGLANG_ALL_RANGE),
-            (RadixCacheShrinkEvictionPatch(), SGLANG_ALL_RANGE),
-            (ResizeBeforeEvictPatch(), SGLANG_ALL_RANGE),
             (SchedulerMemoryLeakPatch(), SGLANG_ALL_RANGE),
+            (RadixCacheShrinkEvictionPatch(), SGLANG_ALL_RANGE),
             (SchedulerShrinkRetractPatch(), SGLANG_ALL_RANGE),
         ]
     )
