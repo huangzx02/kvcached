@@ -69,7 +69,7 @@ def _kvcached_evict_pages_for_shrink_impl(cache, target_num_pages: int) -> int:
     rank = _safe_rank()
 
     max_rounds = 5
-    max_time_ms = 100.0
+    max_time_ms = 1000.0
     start_time = time.perf_counter()
 
     def _time_exceeded() -> bool:
@@ -122,19 +122,53 @@ def _kvcached_evict_pages_for_shrink_impl(cache, target_num_pages: int) -> int:
         return order
 
     # Cache node metadata computed from block IDs.
-    # Value: (block_ids, page_counts, sort_key, tie64)
-    node_cache: dict[Any, tuple[list[int], dict[int, int], tuple[int, ...], int]] = {}
+    # Value: (num_blocks, page_counts, sort_key, tie64)
+    node_cache: dict[Any, tuple[int, dict[int, int], tuple[int, ...], int]] = {}
+
+    persistent_cache = getattr(cache, "_kvcached_shrink_node_info_cache", None)
+    if persistent_cache is None:
+        persistent_cache = weakref.WeakKeyDictionary()
+        setattr(cache, "_kvcached_shrink_node_info_cache", persistent_cache)
+
+    def _tensor_sig(t: torch.Tensor) -> tuple[int, int, str, int, torch.dtype]:
+        dev = t.device
+        return (
+            int(t.data_ptr()),
+            int(t.numel()),
+            str(dev.type),
+            int(dev.index if dev.index is not None else -1),
+            t.dtype,
+        )
 
     def _get_node_info(
         node: Any,
-    ) -> tuple[list[int], dict[int, int], tuple[int, ...], int] | None:
+    ) -> tuple[int, dict[int, int], tuple[int, ...], int] | None:
         cached = node_cache.get(node)
         if cached is not None:
             return cached
 
         val = getattr(node, "value", None)
         if val is None:
+            try:
+                persistent_cache.pop(node, None)
+            except Exception:
+                pass
             return None
+
+        if isinstance(val, torch.Tensor):
+            try:
+                sig = _tensor_sig(val)
+            except Exception:
+                sig = None
+            if sig is not None:
+                cached2 = persistent_cache.get(node)
+                if cached2 is not None:
+                    cached_sig, info = cached2
+                    if cached_sig == sig:
+                        node_cache[node] = info
+                        return info
+        else:
+            sig = None
         try:
             ids = val.detach().cpu().tolist()
         except Exception:
@@ -145,16 +179,14 @@ def _kvcached_evict_pages_for_shrink_impl(cache, target_num_pages: int) -> int:
         if not ids:
             return None
 
-        block_ids: list[int] = []
-        for x in ids:
-            try:
-                block_ids.append(int(x))
-            except Exception:
-                return None
+        try:
+            num_blocks = int(len(ids))
+            first_id = int(ids[0])
+            last_id = int(ids[-1])
+        except Exception:
+            return None
 
         priority = int(getattr(node, "priority", 0) or 0)
-        first_id = int(block_ids[0])
-        last_id = int(block_ids[-1])
 
         min_id = first_id
         max_id = first_id
@@ -165,7 +197,11 @@ def _kvcached_evict_pages_for_shrink_impl(cache, target_num_pages: int) -> int:
         h64 = 1469598103934665603  # FNV-1a offset basis
 
         counts: dict[int, int] = defaultdict(int)
-        for i in block_ids:
+        for x in ids:
+            try:
+                i = int(x)
+            except Exception:
+                return None
             if i < min_id:
                 min_id = i
             if i > max_id:
@@ -181,7 +217,7 @@ def _kvcached_evict_pages_for_shrink_impl(cache, target_num_pages: int) -> int:
         sort_key = (
             priority,  # lower evicted first
             first_id,  # stable across TP ranks
-            len(block_ids),  # smaller nodes first
+            num_blocks,  # smaller nodes first
             last_id,  # stable across TP ranks
             min_id,
             max_id,
@@ -189,19 +225,32 @@ def _kvcached_evict_pages_for_shrink_impl(cache, target_num_pages: int) -> int:
             xor32,
         )
 
-        info = (block_ids, dict(counts), sort_key, int(h64))
+        info = (num_blocks, dict(counts), sort_key, int(h64))
         node_cache[node] = info
+        if sig is not None:
+            try:
+                persistent_cache[node] = (sig, info)
+            except Exception:
+                pass
         return info
 
     def _node_token_len(node: Any) -> int:
+        # Prefer key length to avoid forcing device->host copies of node.value.
+        try:
+            key = getattr(node, "key", None)
+            if key is not None:
+                return int(len(key))
+        except Exception:
+            pass
         info = _get_node_info(node)
         if info is None:
             return 0
-        ids, _counts, _sort_key, _tie64 = info
-        return int(len(ids))
+        num_blocks, _counts, _sort_key, _tie64 = info
+        return int(num_blocks)
 
     total_freed_pages = 0
     for round_idx in range(max_rounds):
+        round_start = time.perf_counter()
         if _time_exceeded():
             break
 
@@ -210,15 +259,20 @@ def _kvcached_evict_pages_for_shrink_impl(cache, target_num_pages: int) -> int:
             break
 
         pages_needed = before_inuse - int(target_num_pages)
+        t0 = time.perf_counter()
         allocated_by_page = _get_allocated_by_page()
+        t_alloc_ms = (time.perf_counter() - t0) * 1000
         if not allocated_by_page:
             break
 
+        t0 = time.perf_counter()
         postorder_nodes = _iter_nodes_postorder()
+        t_post_ms = (time.perf_counter() - t0) * 1000
         if not postorder_nodes:
             break
 
         # Compute subtree token count and "contains locked node" flags.
+        t0 = time.perf_counter()
         subtree_tokens: dict[Any, int] = {}
         subtree_has_lock: dict[Any, bool] = {}
         for node in postorder_nodes:
@@ -243,8 +297,14 @@ def _kvcached_evict_pages_for_shrink_impl(cache, target_num_pages: int) -> int:
 
             subtree_tokens[node] = int(total)
             subtree_has_lock[node] = bool(has_lock)
+            if _time_exceeded():
+                break
+        t_subtree_ms = (time.perf_counter() - t0) * 1000
+        if _time_exceeded():
+            break
 
         # Compute per-page coverage and locked pages.
+        t0 = time.perf_counter()
         locked_pages: set[int] = set()
         known_blocks_by_page: dict[int, int] = defaultdict(int)
         nodes_by_page: dict[int, list[Any]] = defaultdict(list)
@@ -253,7 +313,7 @@ def _kvcached_evict_pages_for_shrink_impl(cache, target_num_pages: int) -> int:
             info = _get_node_info(node)
             if info is None:
                 continue
-            _ids, counts, _sort_key, _tie64 = info
+            _num_blocks, counts, _sort_key, _tie64 = info
             if not counts:
                 continue
 
@@ -266,6 +326,11 @@ def _kvcached_evict_pages_for_shrink_impl(cache, target_num_pages: int) -> int:
                     locked_pages.add(int(pid))
                 else:
                     nodes_by_page[int(pid)].append(node)
+            if _time_exceeded():
+                break
+        t_page_scan_ms = (time.perf_counter() - t0) * 1000
+        if _time_exceeded():
+            break
 
         # Exclude pages that contain pinned blocks (e.g., reserved null block).
         excluded_pages: set[int] = set()
@@ -277,6 +342,7 @@ def _kvcached_evict_pages_for_shrink_impl(cache, target_num_pages: int) -> int:
             except Exception:
                 pass
 
+        t0 = time.perf_counter()
         candidate_pages: list[tuple[int, int, int, list[Any]]] = []
         for pid, allocated in allocated_by_page.items():
             if pid in excluded_pages or pid in locked_pages:
@@ -306,8 +372,8 @@ def _kvcached_evict_pages_for_shrink_impl(cache, target_num_pages: int) -> int:
 
             roots.sort(
                 key=lambda n: (
-                    (_get_node_info(n) or ([], {}, (), 0))[2],
-                    (_get_node_info(n) or ([], {}, (), 0))[3],
+                    (_get_node_info(n) or (0, {}, (), 0))[2],
+                    (_get_node_info(n) or (0, {}, (), 0))[3],
                 )
             )
 
@@ -316,10 +382,16 @@ def _kvcached_evict_pages_for_shrink_impl(cache, target_num_pages: int) -> int:
                 cost_tokens += int(subtree_tokens.get(r, 0))
 
             candidate_pages.append((int(cost_tokens), int(allocated), int(pid), roots))
+            if _time_exceeded():
+                break
+        t_candidate_ms = (time.perf_counter() - t0) * 1000
+        if _time_exceeded():
+            break
 
         if not candidate_pages:
             break
 
+        t0 = time.perf_counter()
         candidate_pages.sort(key=lambda t: (t[0], t[1], t[2]))
         if len(candidate_pages) >= pages_needed:
             selected = candidate_pages[:pages_needed]
@@ -349,8 +421,8 @@ def _kvcached_evict_pages_for_shrink_impl(cache, target_num_pages: int) -> int:
             selected_roots_set,
             key=lambda n: (
                 _depth(n),
-                (_get_node_info(n) or ([], {}, (), 0))[2],
-                (_get_node_info(n) or ([], {}, (), 0))[3],
+                (_get_node_info(n) or (0, {}, (), 0))[2],
+                (_get_node_info(n) or (0, {}, (), 0))[3],
             ),
         )
         minimal_set: set[Any] = set()
@@ -363,58 +435,63 @@ def _kvcached_evict_pages_for_shrink_impl(cache, target_num_pages: int) -> int:
             else:
                 minimal_set.add(r)
 
-        # Mark nodes inside the selected subtrees for fast membership checks.
-        in_target: dict[Any, bool] = {}
-        root = getattr(cache, "root_node", None)
-        stack2: list[tuple[Any, bool]] = [(root, False)] if root is not None else []
-        visited2: set[Any] = set()
+        # Traverse selected subtrees only (avoid scanning the whole tree again).
+        in_target: set[Any] = set()
+        leaves: list[Any] = []
+        stack2: list[Any] = list(minimal_set)
         while stack2:
-            node, active = stack2.pop()
-            if node is None or node in visited2:
+            node = stack2.pop()
+            if node is None or node in in_target:
                 continue
-            visited2.add(node)
-            active2 = active or (node in minimal_set)
-            in_target[node] = bool(active2)
+            in_target.add(node)
 
             children = getattr(node, "children", None)
             if isinstance(children, dict):
                 items = list(children.items())
                 items.sort(key=lambda kv: _stable_child_key(kv[0]))
-                for _k, child in reversed(items):
-                    stack2.append((child, active2))
+                child_list = [c for _k, c in items]
             elif children is not None:
                 try:
                     child_list = list(children)
                 except Exception:
                     child_list = []
                 child_list.sort(key=lambda c: (type(c).__name__, repr(c)))
-                for child in reversed(child_list):
-                    stack2.append((child, active2))
+            else:
+                child_list = []
 
-        leaves = getattr(cache, "_collect_leaves", lambda: [])()
+            if not child_list:
+                leaves.append(node)
+                continue
+
+            for child in reversed(child_list):
+                stack2.append(child)
         pushed: set[Any] = set()
         candidates: list[tuple[tuple[int, ...], int, Any]] = []
 
         def _push(node: Any) -> None:
             if node in pushed:
                 return
-            if not in_target.get(node, False):
+            if node not in in_target:
                 return
             info = _get_node_info(node)
             if info is None:
                 return
-            _ids, _counts, sort_key, tie64 = info
+            _num_blocks, _counts, sort_key, tie64 = info
             heapq.heappush(candidates, (sort_key, tie64, node))
             pushed.add(node)
 
         for node in leaves:
             _push(node)
 
+        t_select_ms = (time.perf_counter() - t0) * 1000
+
         num_nodes_evicted = 0
+        pending_free: list[torch.Tensor] = []
+        t0 = time.perf_counter()
         while remaining and candidates and not _time_exceeded():
             _sort_key, _tie64, node = heapq.heappop(candidates)
 
-            if not in_target.get(node, False):
+            if node not in in_target:
                 continue
             if int(getattr(node, "lock_ref", 1) or 0) != 0:
                 continue
@@ -431,9 +508,34 @@ def _kvcached_evict_pages_for_shrink_impl(cache, target_num_pages: int) -> int:
             info = _get_node_info(node)
             if info is None:
                 continue
-            ids, counts, _sort_key2, _tie64b = info
+            _num_blocks, counts, _sort_key2, _tie64b = info
 
-            cache.token_to_kv_pool_allocator.free(ids)
+            # Batch frees to reduce TP-wide unmap calls (the expensive part).
+            try:
+                val = getattr(node, "value", None)
+                if isinstance(val, torch.Tensor):
+                    if val.numel() > 0:
+                        pending_free.append(val)
+                elif val is not None:
+                    try:
+                        ids = [int(x) for x in val]
+                    except Exception:
+                        ids = []
+                    if ids:
+                        allocator.free(ids)
+            except Exception:
+                # Best-effort: fall back to immediate free.
+                try:
+                    val = getattr(node, "value", None)
+                    if isinstance(val, torch.Tensor):
+                        if val.numel() > 0:
+                            pending_free.append(val)
+                    elif val is not None:
+                        ids = [int(x) for x in val]
+                        if ids:
+                            allocator.free(ids)
+                except Exception:
+                    pass
             cache._delete_leaf(node)
             cache._record_remove_event(node)
             num_nodes_evicted += 1
@@ -448,12 +550,23 @@ def _kvcached_evict_pages_for_shrink_impl(cache, target_num_pages: int) -> int:
             while (
                 p is not None
                 and p != getattr(cache, "root_node", None)
-                and in_target.get(p, False)
+                and p in in_target
                 and int(getattr(p, "lock_ref", 1) or 0) == 0
                 and len(getattr(p, "children", {})) == 0
             ):
                 _push(p)
                 p = getattr(p, "parent", None)
+
+        t_evict_ms = (time.perf_counter() - t0) * 1000
+
+        free_ms = 0.0
+        if pending_free:
+            free_start = time.perf_counter()
+            if len(pending_free) == 1:
+                cache.token_to_kv_pool_allocator.free(pending_free[0])
+            else:
+                cache.token_to_kv_pool_allocator.free(torch.cat(pending_free))
+            free_ms = (time.perf_counter() - free_start) * 1000
 
         after_inuse = int(page_allocator.get_num_inuse_pages())
         freed = before_inuse - after_inuse
@@ -462,7 +575,13 @@ def _kvcached_evict_pages_for_shrink_impl(cache, target_num_pages: int) -> int:
                 f"[shrink-evict] round={round_idx} before_inuse={before_inuse} "
                 f"after_inuse={after_inuse} target={target_num_pages} "
                 f"selected_pages={sorted(selected_pages_set)} freed_pages={freed} "
-                f"evicted_nodes={num_nodes_evicted}"
+                f"evicted_nodes={num_nodes_evicted} free_ms={free_ms:.1f} "
+                f"round_ms={(time.perf_counter() - round_start) * 1000:.1f} "
+                f"alloc_ms={t_alloc_ms:.1f} post_ms={t_post_ms:.1f} "
+                f"subtree_ms={t_subtree_ms:.1f} scan_ms={t_page_scan_ms:.1f} "
+                f"cand_ms={t_candidate_ms:.1f} select_ms={t_select_ms:.1f} "
+                f"evict_ms={t_evict_ms:.1f} nodes={len(postorder_nodes)} "
+                f"candidates={len(candidate_pages)}"
             )
 
         if freed <= 0 and num_nodes_evicted == 0:
@@ -822,6 +941,60 @@ class RadixCacheShrinkEvictionPatch(VersionAwarePatch, BasePatch):
 
         RadixCache.__init__ = _wrapped_init  # type: ignore[assignment]
         RadixCache._kvcached_evict_pages_for_shrink = _kvcached_evict_pages_for_shrink  # type: ignore[attr-defined]
+
+        # Batch radix eviction frees when kvcached is enabled to reduce the number
+        # of TP-wide unmap calls. This keeps eviction semantics the same, but
+        # performs the underlying allocator free in a single batched call.
+        original_evict = getattr(RadixCache, "evict", None)
+        if original_evict is not None and not self._is_already_patched(original_evict):
+
+            def _wrapped_evict(self, num_tokens: int):
+                if not enable_kvcached() or getattr(self, "disable", False):
+                    return original_evict(self, num_tokens)
+
+                tok_alloc = getattr(self, "token_to_kv_pool_allocator", None)
+                if tok_alloc is None or not hasattr(tok_alloc, "kvcached_allocator"):
+                    return original_evict(self, num_tokens)
+
+                start_time = time.perf_counter()
+                leaves = self._collect_leaves()
+                eviction_heap = [
+                    (self.eviction_strategy.get_priority(node), node) for node in leaves
+                ]
+                heapq.heapify(eviction_heap)
+
+                num_evicted = 0
+                pending_free: list[torch.Tensor] = []
+                while num_evicted < num_tokens and eviction_heap:
+                    _priority, x = heapq.heappop(eviction_heap)
+
+                    val = getattr(x, "value", None)
+                    if isinstance(val, torch.Tensor) and val.numel() > 0:
+                        pending_free.append(val.to(dtype=torch.int64, copy=False))
+                        num_evicted += int(val.numel())
+                    else:
+                        # Fallback: keep the original behavior.
+                        tok_alloc.free(x.value)
+                        num_evicted += len(x.value)
+
+                    self._delete_leaf(x)
+
+                    if len(x.parent.children) == 0 and x.parent.lock_ref == 0:
+                        new_priority = self.eviction_strategy.get_priority(x.parent)
+                        heapq.heappush(eviction_heap, (new_priority, x.parent))
+
+                    self._record_remove_event(x)
+
+                if pending_free:
+                    if len(pending_free) == 1:
+                        tok_alloc.free(pending_free[0])
+                    else:
+                        tok_alloc.free(torch.cat(pending_free))
+
+                self.update_eviction_metrics(num_evicted, start_time)
+
+            self._mark_as_patched(_wrapped_evict)
+            setattr(RadixCache, "evict", _wrapped_evict)
 
         self._mark_as_patched(RadixCache, "__kvcached_shrink_eviction__")
         return True
