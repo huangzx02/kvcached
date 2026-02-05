@@ -19,7 +19,7 @@ import torch
 from kvcached.locks import NoOpLock
 from kvcached.page_allocator import Page, PageAllocator
 from kvcached.tp_ipc_util import broadcast_kv_tensors_created
-from kvcached.utils import PAGE_SIZE, SANITY_CHECK, get_kvcached_logger
+from kvcached.utils import CONTIGUOUS_LAYOUT, PAGE_SIZE, SANITY_CHECK, get_kvcached_logger
 from kvcached.vmm_ops import kv_tensors_created
 
 logger = get_kvcached_logger()
@@ -51,6 +51,7 @@ class KVCacheManager:
         tp_size: int = 1,
         async_sched: bool = False,
         reserve_null_block: bool = False,
+        contiguous_layout: Optional[bool] = None,
     ):
         """
         Args:
@@ -63,6 +64,8 @@ class KVCacheManager:
             reserve_null_block: Whether to reserve the first block as null block
                 for padding tokens. This is required by SGLang which assumes the
                 first block is always reserved as padded tokens.
+            contiguous_layout: Whether to use token-major contiguous layout.
+                If None, defaults to global CONTIGUOUS_LAYOUT.
         """
         self.num_blocks = num_blocks
         self.block_mem_size = block_size * cell_size
@@ -74,12 +77,15 @@ class KVCacheManager:
         # NOTE: this is the memory size of the K or V tensor in one layer
         self.mem_size = self.num_blocks * self.block_mem_size
         self.tp_size = tp_size
+
+        resolved_layout = CONTIGUOUS_LAYOUT if contiguous_layout is None else bool(contiguous_layout)
         self.page_allocator = PageAllocator(
             self.num_layers,
             self.mem_size,
             self.page_size,
             self.tp_size,
             async_sched=async_sched,
+            contiguous_layout=resolved_layout,
         )
 
         self.num_avail_blocks = 0  # Only count free blocks in avail_pages
@@ -191,8 +197,8 @@ class KVCacheManager:
             self.free_reserved()
 
         if self.available_size() < need_size:
-            logger.warning(f"available_size()={self.available_size()} < "
-                           f"need_size={need_size}")
+            # logger.warning(f"available_size()={self.available_size()} < "
+            #                f"need_size={need_size}")
             return None
 
         ret_index = []
@@ -284,11 +290,14 @@ class KVCacheManager:
             assert self.target_num_blocks is not None
             if self._get_num_alloced_blocks() <= self.target_num_blocks:
                 new_mem_size = self.target_num_blocks * self.block_mem_size
-                self.page_allocator.resize(new_mem_size)
-                # Keep the current limit in sync with the allocator.
-                self.mem_size = new_mem_size
-                self.in_shrink = False
-                self.target_num_blocks = None
+                # Only mark shrink as finished if the allocator actually resized.
+                # Otherwise, we may desync `mem_size` and `num_total_pages`, which
+                # can allow allocations to grow past the requested limit.
+                if self.page_allocator.resize(new_mem_size):
+                    # Keep the current limit in sync with the allocator.
+                    self.mem_size = new_mem_size
+                    self.in_shrink = False
+                    self.target_num_blocks = None
 
     @synchronized
     def try_to_reserve(self, need_size: int) -> bool:

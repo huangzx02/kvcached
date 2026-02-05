@@ -5,6 +5,7 @@
 SGLang-specific patches using unified patch infrastructure.
 """
 
+import math
 import inspect
 import types
 from typing import Any, Union
@@ -69,7 +70,8 @@ class ElasticAllocatorPatch(VersionAwarePatch, BasePatch):
                         # Match SGLang allocator contract: return None on OOM so callers
                         # can raise a proper error message (instead of crashing here).
                         return None
-                    return torch.tensor(indices, dtype=torch.int32, device="cuda")
+                    # SGLang HiCache kernels expect int64 indices.
+                    return torch.tensor(indices, dtype=torch.int64, device=self.device)
 
                 def free(self, free_index):
                     if self.is_not_in_free_group:
@@ -201,23 +203,71 @@ class ElasticMemoryPoolPatch(VersionAwarePatch, BasePatch):
                 def _create_buffers(self):
                     import kvcached.integration.sglang.interfaces as kvi
 
-                    # Initialize kvcached with overlap scheduling to be conservative
-                    kvi.init_kvcached(async_sched=True)
-
                     if "cuda" not in self.device:
                         raise ValueError("ElasticMHATokenToKVPool only supports cuda device")
+                    if self.page_size != 1:
+                        raise NotImplementedError(
+                            "ElasticMHATokenToKVPool currently only supports page_size=1 for SGLang HiCache."
+                        )
+                    if getattr(self, "v_head_dim", None) is not None and int(self.v_head_dim) != int(self.head_dim):
+                        raise NotImplementedError(
+                            "ElasticMHATokenToKVPool currently requires v_head_dim == head_dim."
+                        )
+
+                    # Initialize kvcached. TP IPC is optional and controlled by
+                    # env var KVCACHED_SGLANG_TP_IPC in the interfaces module.
+                    tp_rank, tp_size = 0, 1
+                    try:
+                        if torch.distributed.is_available() and torch.distributed.is_initialized():
+                            tp_rank = int(torch.distributed.get_rank())
+                            tp_size = int(torch.distributed.get_world_size())
+                    except Exception:
+                        tp_rank, tp_size = 0, 1
+
+                    device_str: str | None
+                    try:
+                        device_str = str(self.device)
+                        if ":" not in device_str:
+                            device_str = None
+                    except Exception:
+                        device_str = None
+                    kvi.init_kvcached(
+                        tp_rank=tp_rank,
+                        tp_size=tp_size,
+                        device=device_str,
+                        async_sched=True,
+                        contiguous_layout=None,
+                    )
+
                     self.k_buffer, self.v_buffer = kvi.alloc_kv_cache(
                         kvcache_shape=(
                             self.size + self.page_size,
                             self.head_num,
                             self.head_dim,
                         ),
-                        dtype=self.dtype,
+                        dtype=self.store_dtype,
                         device=self.device,
                         num_layers=self.layer_num,
                         page_size=self.page_size,
                         attention_type="MHA",
                         kv_layout="NHD",
+                    )
+
+                    # HiCache expects pointer arrays on the device pool.
+                    self.k_data_ptrs = torch.tensor(
+                        [t.data_ptr() for t in self.k_buffer],
+                        dtype=torch.uint64,
+                        device=self.device,
+                    )
+                    self.v_data_ptrs = torch.tensor(
+                        [t.data_ptr() for t in self.v_buffer],
+                        dtype=torch.uint64,
+                        device=self.device,
+                    )
+                    self.data_ptrs = torch.cat([self.k_data_ptrs, self.v_data_ptrs], dim=0)
+                    self.data_strides = torch.tensor(
+                        [math.prod(t.shape[1:]) * t.dtype.itemsize for t in (self.k_buffer + self.v_buffer)],
+                        device=self.device,
                     )
 
                 def get_kv_size_bytes_phy(self):

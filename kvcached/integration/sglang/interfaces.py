@@ -2,13 +2,14 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import math
+import os
 from typing import List, Optional, Tuple
 
 import torch
 
 from kvcached.kv_cache_manager import KVCacheManager
 from kvcached.tp_ipc_util import start_worker_listener_thread
-from kvcached.utils import CONTIGUOUS_LAYOUT, PAGE_SIZE, get_kvcached_logger
+from kvcached.utils import PAGE_SIZE, get_kvcached_logger
 from kvcached.vmm_ops import (
     create_kv_tensors,
     init_kvcached as _init_kvcached_impl,
@@ -20,7 +21,39 @@ logger = get_kvcached_logger()
 _kvcached_initialized: bool = False
 _kvcached_device = None
 _async_sched = False
-_contiguous_layout = CONTIGUOUS_LAYOUT
+_tp_rank: int = 0
+_tp_size: int = 1
+
+# SGLang HiCache compatibility:
+# - Default to per-layer contiguous tensors (token-major contiguous layout can
+#   break HiCache one-layer JIT kernel due to .view() on non-contiguous views).
+_contiguous_layout: bool = False
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    val = os.getenv(name)
+    if val is None:
+        return default
+    val = val.strip().lower()
+    if val in ("1", "true", "yes", "y", "on"):
+        return True
+    if val in ("0", "false", "no", "n", "off"):
+        return False
+    return default
+
+
+def _resolve_tp_ipc_enabled() -> bool:
+    # kvcached TP IPC (unix socket broadcast) is optional for SGLang and is
+    # disabled by default to avoid startup ordering/rank mapping issues.
+    return _env_flag("KVCACHED_SGLANG_TP_IPC", False)
+
+
+def _resolve_contiguous_layout(arg: Optional[bool]) -> bool:
+    if arg is not None:
+        return bool(arg)
+    if os.getenv("KVCACHED_SGLANG_CONTIGUOUS_LAYOUT") is None:
+        return False
+    return _env_flag("KVCACHED_SGLANG_CONTIGUOUS_LAYOUT", False)
 
 
 def init_kvcached(
@@ -28,26 +61,35 @@ def init_kvcached(
     tp_size: int = 1,
     device: Optional[str] = None,
     async_sched: bool = False,
+    contiguous_layout: Optional[bool] = None,
 ) -> None:
-    global _kvcached_initialized, _kvcached_device, _async_sched
+    global _kvcached_initialized, _kvcached_device, _async_sched, _tp_rank, _tp_size, _contiguous_layout
     if _kvcached_initialized:
         return
 
     if device is None:
         device = f"cuda:{torch.cuda.current_device()}"
 
-    _init_kvcached_impl(device, PAGE_SIZE, _contiguous_layout)
+    tp_ipc_enabled = _resolve_tp_ipc_enabled()
+    resolved_tp_size = max(1, int(tp_size)) if tp_ipc_enabled else 1
+    resolved_layout = _resolve_contiguous_layout(contiguous_layout)
+
+    _init_kvcached_impl(device, PAGE_SIZE, resolved_layout)
     _kvcached_initialized = True
     _kvcached_device = device
     _async_sched = async_sched
+    _tp_rank = max(0, int(tp_rank))
+    _tp_size = int(resolved_tp_size)
+    _contiguous_layout = bool(resolved_layout)
 
-    if tp_size > 1:
-        # start the listener thread for tensor parallel kv cache management
-        start_worker_listener_thread(torch.cuda.current_device())
+    if resolved_tp_size > 1:
+        # Start the listener thread for tensor parallel kv cache management.
+        # NOTE: rank must come from the TP process rank, not cuda device index.
+        start_worker_listener_thread(int(tp_rank))
 
 
 def shutdown_kvcached() -> None:
-    global _kvcached_initialized, _kvcached_device, _async_sched
+    global _kvcached_initialized, _kvcached_device, _async_sched, _tp_rank, _tp_size, _contiguous_layout
     if not _kvcached_initialized:
         return
 
@@ -55,6 +97,9 @@ def shutdown_kvcached() -> None:
     _kvcached_initialized = False
     _kvcached_device = None
     _async_sched = False
+    _tp_rank = 0
+    _tp_size = 1
+    _contiguous_layout = False
 
 
 def alloc_kv_cache(
@@ -142,6 +187,8 @@ def get_kv_cache_manager(
         block_size,
         cell_size,
         num_layers,
+        tp_size=_tp_size,
         async_sched=_async_sched,
         reserve_null_block=reserve_null_block,
+        contiguous_layout=_contiguous_layout,
     )
