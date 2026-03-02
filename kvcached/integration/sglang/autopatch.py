@@ -11,6 +11,7 @@ from kvcached.integration.sglang.patches import (
     SGLANG_ALL_RANGE,
     ElasticAllocatorPatch,
     ElasticMemoryPoolPatch,
+    ElasticMLAMemoryPoolPatch,
     SchedulerMemoryLeakPatch,
 )
 from kvcached.integration.sglang.hiradix_cache_patches import HiRadixCacheShrinkEvictionPatch
@@ -40,6 +41,7 @@ def _patch_sglang(_sglang: types.ModuleType) -> None:
         [
             (ElasticAllocatorPatch(), SGLANG_ALL_RANGE),
             (ElasticMemoryPoolPatch(), SGLANG_ALL_RANGE),
+            (ElasticMLAMemoryPoolPatch(), SGLANG_ALL_RANGE),
             (SchedulerMemoryLeakPatch(), SGLANG_ALL_RANGE),
             (RadixCacheShrinkEvictionPatch(), SGLANG_ALL_RANGE),
             (HiRadixCacheShrinkEvictionPatch(), SGLANG_ALL_RANGE),
