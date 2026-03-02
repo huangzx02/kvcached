@@ -13,7 +13,14 @@ import time
 from typing import List, Optional, Tuple, TypedDict
 
 from kvcached.cli.kvtop import _detect_kvcache_ipc_names, kvtop as kvtop_ui
-from kvcached.cli.utils import _format_size, delete_kv_cache_segment, get_kv_cache_limit, update_kv_cache_limit
+from kvcached.cli.utils import (
+    _format_size,
+    delete_kv_cache_segment,
+    get_hotness_control,
+    get_kv_cache_limit,
+    set_hotness_control,
+    update_kv_cache_limit,
+)
 
 try:
     import readline  # type: ignore
@@ -61,7 +68,7 @@ def _clr(text: str, color: Optional[str] = None, *, bold: bool = False) -> str:
 
 
 COMMANDS = [
-    'list', 'limit', 'limit-percent', 'watch', 'kvtop', 'delete',
+    'list', 'limit', 'limit-percent', 'watch', 'kvtop', 'hotness', 'delete',
     'cleanup-orphaned', 'help', 'exit', 'quit'
 ]
 
@@ -73,6 +80,7 @@ Available commands:
   limit-percent <ipc> <pct>    Set limit as percentage of total GPU RAM
   watch [-n sec] [ipc ...]     Continuously display usage table
   kvtop [ipc ...] [--refresh r]  Launch curses kvtop UI (q to quit)
+  hotness <on|off|status> [ipc ...]  Toggle/query runtime KV hotness tracing
   !<shell cmd>                 Run command in system shell
   help                         Show this help message
   delete <ipc>                 Delete IPC segment and its limit entry
@@ -119,7 +127,12 @@ def _setup_readline():
 
             cmd = tokens[0]
 
-            if cmd in ('limit', 'limit-percent', 'list', 'watch', 'delete'):
+            if cmd == 'hotness':
+                options = [
+                    subcmd for subcmd in ('on', 'off', 'status')
+                    if subcmd.startswith(text)
+                ]
+            elif cmd in ('limit', 'limit-percent', 'list', 'watch', 'delete'):
                 ipc_names = _detect_kvcache_ipc_names()
                 # Case-insensitive matching so "VLLM" also matches "vllm".
                 options = [
@@ -129,7 +142,18 @@ def _setup_readline():
                 options = [c for c in COMMANDS if c.startswith(text)]
         else:
             cmd = tokens[0]
-            if cmd in ('limit', 'limit-percent', 'list', 'watch', 'delete'):
+            if cmd == 'hotness':
+                if len(tokens) == 2:
+                    options = [
+                        subcmd for subcmd in ('on', 'off', 'status')
+                        if subcmd.startswith(text)
+                    ]
+                else:
+                    options = [
+                        n for n in _detect_kvcache_ipc_names()
+                        if n.lower().startswith(text.lower())
+                    ]
+            elif cmd in ('limit', 'limit-percent', 'list', 'watch', 'delete'):
                 options = [
                     n for n in _detect_kvcache_ipc_names()
                     if n.lower().startswith(text.lower())
@@ -464,6 +488,58 @@ def cmd_cleanup_orphaned(dry_run: bool = False):
               file=sys.stderr)
 
 
+def _resolve_hotness_ipcs(ipcs: Optional[List[str]]) -> List[str]:
+    if ipcs:
+        return ipcs
+    return _detect_kvcache_ipc_names()
+
+
+def cmd_hotness_set(enabled: bool, ipcs: Optional[List[str]] = None) -> None:
+    target_ipcs = _resolve_hotness_ipcs(ipcs)
+    if not target_ipcs:
+        print(_clr("No active KVCached segments found.", 'red', bold=True), file=sys.stderr)
+        return
+
+    action = "ON" if enabled else "OFF"
+    for ipc in target_ipcs:
+        if get_kv_cache_limit(ipc) is None:
+            print(_clr(f"Skipping unknown IPC '{ipc}'", 'yellow'))
+            continue
+        state = set_hotness_control(
+            ipc_name=ipc,
+            enabled=enabled,
+            bump_session=enabled,
+        )
+        print(
+            _clr(
+                f"{ipc}: hotness={action}, session_id={state.session_id}, revision={state.revision}",
+                'green' if enabled else 'yellow',
+            )
+        )
+
+
+def cmd_hotness_status(ipcs: Optional[List[str]] = None) -> None:
+    target_ipcs = _resolve_hotness_ipcs(ipcs)
+    if not target_ipcs:
+        print(_clr("No active KVCached segments found.", 'red', bold=True), file=sys.stderr)
+        return
+
+    print(_clr(f"{'IPC':24} {'Enabled':>8} {'Session':>10} {'Revision':>10}", 'cyan', bold=True))
+    for ipc in target_ipcs:
+        if get_kv_cache_limit(ipc) is None:
+            print(_clr(f"{ipc:<24} {'N/A':>8} {'N/A':>10} {'N/A':>10}", 'yellow'))
+            continue
+        state = get_hotness_control(ipc)
+        enabled = "ON" if int(state.enabled) == 1 else "OFF"
+        color = 'green' if enabled == "ON" else 'yellow'
+        print(
+            _clr(
+                f"{ipc:<24} {enabled:>8} {int(state.session_id):>10} {int(state.revision):>10}",
+                color,
+            )
+        )
+
+
 # ---------------------------------------------------------------------------
 # Interactive shell
 # ---------------------------------------------------------------------------
@@ -543,6 +619,19 @@ def interactive_shell():
                         ipcs_top.append(tok)
                     i += 1
                 cmd_top(ipcs_top if ipcs_top else None, refresh)
+            elif cmd == 'hotness':
+                if len(tokens) < 2:
+                    raise ValueError("Usage: hotness <on|off|status> [ipc ...]")
+                hotness_action = tokens[1]
+                hotness_ipcs = tokens[2:] if len(tokens) > 2 else None
+                if hotness_action == 'on':
+                    cmd_hotness_set(True, hotness_ipcs)
+                elif hotness_action == 'off':
+                    cmd_hotness_set(False, hotness_ipcs)
+                elif hotness_action == 'status':
+                    cmd_hotness_status(hotness_ipcs)
+                else:
+                    raise ValueError("Usage: hotness <on|off|status> [ipc ...]")
             elif cmd == 'delete' and len(tokens) == 2:
                 cmd_delete(tokens[1])
             elif cmd == 'cleanup-orphaned':
@@ -599,6 +688,20 @@ def main():
                          help='Refresh interval')
     p_kvtop.add_argument('ipc', nargs='*', help='IPC names (optional)')
 
+    # hotness
+    p_hotness = sub.add_parser(
+        'hotness', help='Control runtime KV hotness tracing'
+    )
+    hotness_sub = p_hotness.add_subparsers(dest='hotness_cmd')
+    p_hotness_on = hotness_sub.add_parser('on', help='Enable KV hotness tracing')
+    p_hotness_on.add_argument('ipc', nargs='*', help='IPC names (optional)')
+    p_hotness_off = hotness_sub.add_parser('off', help='Disable KV hotness tracing')
+    p_hotness_off.add_argument('ipc', nargs='*', help='IPC names (optional)')
+    p_hotness_status = hotness_sub.add_parser(
+        'status', help='Show KV hotness tracing status'
+    )
+    p_hotness_status.add_argument('ipc', nargs='*', help='IPC names (optional)')
+
     # delete
     p_del = sub.add_parser('delete', help='Delete IPC segment')
     p_del.add_argument('ipc')
@@ -626,6 +729,15 @@ def main():
         cmd_watch(args.interval, args.ipc if args.ipc else None)
     elif args.command == 'kvtop':
         cmd_top(args.ipc if args.ipc else None, args.refresh)
+    elif args.command == 'hotness':
+        if args.hotness_cmd == 'on':
+            cmd_hotness_set(True, args.ipc if args.ipc else None)
+        elif args.hotness_cmd == 'off':
+            cmd_hotness_set(False, args.ipc if args.ipc else None)
+        elif args.hotness_cmd == 'status':
+            cmd_hotness_status(args.ipc if args.ipc else None)
+        else:
+            parser.error("hotness requires one of: on, off, status")
     elif args.command == 'delete':
         cmd_delete(args.ipc)
     elif args.command == 'cleanup-orphaned':

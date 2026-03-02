@@ -51,6 +51,30 @@ class MemInfoStruct:
         arr[:] = (self.total_size, self.used_size, self.prealloc_size)
 
 
+@dataclass
+class HotnessControlStruct:
+    enabled: int
+    session_id: int
+    revision: int
+
+    DTYPE = np.int64
+    N_FIELDS = 3
+    SHM_SIZE = np.dtype(DTYPE).itemsize * N_FIELDS
+
+    @classmethod
+    def _view(cls, buf: mmap.mmap) -> np.ndarray:
+        return np.ndarray((cls.N_FIELDS,), dtype=cls.DTYPE, buffer=buf)
+
+    @classmethod
+    def from_buffer(cls, buf: mmap.mmap) -> "HotnessControlStruct":
+        arr = cls._view(buf)
+        return cls(int(arr[0]), int(arr[1]), int(arr[2]))
+
+    def write_to_buffer(self, buf: mmap.mmap) -> None:
+        arr = self._view(buf)
+        arr[:] = (int(self.enabled), int(self.session_id), int(self.revision))
+
+
 class RwLockedShm:
     RLOCK = fcntl.LOCK_SH
     WLOCK = fcntl.LOCK_EX
@@ -153,6 +177,76 @@ def update_kv_cache_limit(ipc_name: str,
         return None
 
 
+HOTNESS_CTRL_SUFFIX = "_hotness_ctrl"
+
+
+def _hotness_control_name(ipc_name: str) -> str:
+    base = get_ipc_name(ipc_name)
+    return f"{base}{HOTNESS_CTRL_SUFFIX}"
+
+
+def ensure_hotness_control_segment(ipc_name: str) -> str:
+    shm_name = _hotness_control_name(ipc_name)
+    created = False
+    try:
+        shm = posix_ipc.SharedMemory(
+            shm_name,
+            posix_ipc.O_CREX,
+            size=HotnessControlStruct.SHM_SIZE,
+            mode=0o666,
+        )
+        created = True
+    except posix_ipc.ExistentialError:
+        shm = posix_ipc.SharedMemory(
+            shm_name,
+            posix_ipc.O_CREAT,
+            size=HotnessControlStruct.SHM_SIZE,
+            mode=0o666,
+        )
+    shm.close_fd()
+
+    if created:
+        with RwLockedShm(
+            shm_name, HotnessControlStruct.SHM_SIZE, RwLockedShm.WLOCK
+        ) as mm:
+            HotnessControlStruct(enabled=0, session_id=0, revision=0).write_to_buffer(mm)
+
+    return shm_name
+
+
+def get_hotness_control(ipc_name: str) -> HotnessControlStruct:
+    shm_name = ensure_hotness_control_segment(ipc_name)
+    with RwLockedShm(
+        shm_name, HotnessControlStruct.SHM_SIZE, RwLockedShm.RLOCK
+    ) as mm:
+        return HotnessControlStruct.from_buffer(mm)
+
+
+def set_hotness_control(
+    ipc_name: str,
+    enabled: bool,
+    bump_session: bool = False,
+) -> HotnessControlStruct:
+    shm_name = ensure_hotness_control_segment(ipc_name)
+    with RwLockedShm(
+        shm_name, HotnessControlStruct.SHM_SIZE, RwLockedShm.WLOCK
+    ) as mm:
+        state = HotnessControlStruct.from_buffer(mm)
+        next_enabled = 1 if enabled else 0
+        next_session_id = int(state.session_id)
+        if next_enabled == 1 and bump_session:
+            next_session_id += 1
+        next_revision = int(state.revision) + 1
+
+        next_state = HotnessControlStruct(
+            enabled=next_enabled,
+            session_id=next_session_id,
+            revision=next_revision,
+        )
+        next_state.write_to_buffer(mm)
+        return next_state
+
+
 # ---------------------------------------------------------------------------
 # IPC cleanup helpers
 # ---------------------------------------------------------------------------
@@ -166,6 +260,7 @@ def delete_kv_cache_segment(ipc_name: str) -> bool:
     errors.
     """
     shm_name = get_ipc_name(ipc_name)
+    hotness_ctrl_name = _hotness_control_name(ipc_name)
 
     removed = False
     try:
@@ -179,6 +274,16 @@ def delete_kv_cache_segment(ipc_name: str) -> bool:
     try:
         os.unlink(get_ipc_path(shm_name))
         removed = True or removed
+    except FileNotFoundError:
+        pass
+
+    # Best-effort cleanup for hotness control segment associated with this IPC.
+    try:
+        posix_ipc.unlink_shared_memory(hotness_ctrl_name)
+    except posix_ipc.ExistentialError:
+        pass
+    try:
+        os.unlink(get_ipc_path(hotness_ctrl_name))
     except FileNotFoundError:
         pass
 

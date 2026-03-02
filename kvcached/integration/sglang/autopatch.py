@@ -14,6 +14,7 @@ from kvcached.integration.sglang.patches import (
     SchedulerMemoryLeakPatch,
 )
 from kvcached.integration.sglang.hiradix_cache_patches import HiRadixCacheShrinkEvictionPatch
+from kvcached.integration.sglang.kv_hotness_patches import ScheduleBatchKVHotnessPatch
 from kvcached.integration.sglang.radix_cache_patches import RadixCacheShrinkEvictionPatch
 from kvcached.integration.sglang.scheduler_patches import SchedulerShrinkRetractPatch
 from kvcached.utils import get_kvcached_logger
@@ -43,6 +44,7 @@ def _patch_sglang(_sglang: types.ModuleType) -> None:
             (RadixCacheShrinkEvictionPatch(), SGLANG_ALL_RANGE),
             (HiRadixCacheShrinkEvictionPatch(), SGLANG_ALL_RANGE),
             (SchedulerShrinkRetractPatch(), SGLANG_ALL_RANGE),
+            (ScheduleBatchKVHotnessPatch(), SGLANG_ALL_RANGE),
         ]
     )
 
