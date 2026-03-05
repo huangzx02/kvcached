@@ -650,16 +650,33 @@ class RadixCacheShrinkEvictionPatch(VersionAwarePatch, BasePatch):
         original_evict = getattr(RadixCache, "evict", None)
         if original_evict is not None and not self._is_already_patched(original_evict):
 
-            def _wrapped_evict(self, num_tokens: int):
+            def _wrapped_evict(self, params):
                 if not enable_kvcached() or getattr(self, "disable", False):
-                    return original_evict(self, num_tokens)
+                    return original_evict(self, params)
 
                 tok_alloc = getattr(self, "token_to_kv_pool_allocator", None)
                 if tok_alloc is None or not hasattr(tok_alloc, "kvcached_allocator"):
-                    return original_evict(self, num_tokens)
+                    return original_evict(self, params)
+
+                # SGLang >= 0.5 uses EvictParams(num_tokens=...), older versions
+                # may pass the integer directly. Support both.
+                try:
+                    num_tokens = int(getattr(params, "num_tokens"))
+                    is_params_obj = True
+                except Exception:
+                    try:
+                        num_tokens = int(params)
+                        is_params_obj = False
+                    except Exception:
+                        return original_evict(self, params)
 
                 start_time = time.perf_counter()
-                leaves = self._collect_leaves()
+                if hasattr(self, "evictable_leaves"):
+                    leaves = list(getattr(self, "evictable_leaves") or [])
+                elif hasattr(self, "_collect_leaves"):
+                    leaves = self._collect_leaves()
+                else:
+                    return original_evict(self, params)
                 eviction_heap = [
                     (self.eviction_strategy.get_priority(node), node) for node in leaves
                 ]
@@ -693,7 +710,19 @@ class RadixCacheShrinkEvictionPatch(VersionAwarePatch, BasePatch):
                     else:
                         tok_alloc.free(torch.cat(pending_free))
 
-                self.update_eviction_metrics(num_evicted, start_time)
+                try:
+                    self.update_eviction_metrics(num_evicted, start_time)
+                except Exception:
+                    pass
+
+                if is_params_obj:
+                    EvictResult = getattr(radix_mod, "EvictResult", None)
+                    if EvictResult is not None:
+                        try:
+                            return EvictResult(num_tokens_evicted=num_evicted)
+                        except Exception:
+                            pass
+                return int(num_evicted)
 
             self._mark_as_patched(_wrapped_evict)
             setattr(RadixCache, "evict", _wrapped_evict)

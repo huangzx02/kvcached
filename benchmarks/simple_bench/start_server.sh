@@ -10,7 +10,15 @@ DEFAULT_MODEL="meta-llama/Llama-3.2-1B"
 DEFAULT_PORT_VLLM=12346
 DEFAULT_PORT_SGL=30000
 DEFAULT_TP_SIZE=1
-
+USE_HICACHE=1
+HICACHE_SIZE=50
+export KVCACHED_SGLANG_KV_HOTNESS=1
+export KVCACHED_SGLANG_KV_HOTNESS_OUTPUT_DIR=./hotness
+mkdir -p ./hotness
+export KVCACHED_LOG_LEVEL=DEBUG
+export KVCACHED_TP_COORDINATOR=0
+export KVCACHED_TP_IPC_TIMEOUT_SEC=2
+export KVCACHED_TRACE_ALLOC=1
 # CLI args (set via getopt) plus one positional 'engine'
 engine=""      # positional: vllm | sglang
 port=""        # if omitted, falls back to engine-specific defaults
@@ -124,6 +132,11 @@ else
     IS_L4=false
 fi
 
+HICACHE_ARGS=""
+if [ "$USE_HICACHE" == "1" ]; then
+    HICACHE_ARGS="--enable-hierarchical-cache --hicache-size $HICACHE_SIZE"
+fi
+
 if [ "$engine" == "vllm" ]; then
     # Activate virtual environment if provided
     if [[ -n "$VENV_PATH" ]]; then source "$VENV_PATH/bin/activate"; fi
@@ -156,11 +169,11 @@ elif [ "$engine" == "sgl" -o "$engine" == "sglang" ]; then
         SGL_L4_ARGS="--attention-backend torch_native"
     fi
     $PYTHON -m sglang.launch_server --model "$MODEL" \
-    --disable-radix-cache \
     --trust-remote-code \
     --port "$SGL_PORT" \
     --tp "$TP_SIZE" \
-    $SGL_L4_ARGS
+    $SGL_L4_ARGS \
+    $HICACHE_ARGS
     if [[ -n "$VENV_PATH" ]]; then deactivate; fi
 else
     echo "Invalid engine: $engine"

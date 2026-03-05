@@ -788,6 +788,20 @@ def _kvcached_evict_pages_for_shrink_impl(cache, target_num_pages: int) -> int:
                 except Exception:
                     pass
                 node.value = None
+                # Keep internal eviction sets consistent with SGLang's
+                # HiRadixCache._evict_backuped semantics.
+                try:
+                    cache._update_leaf_status(node)
+                except Exception:
+                    pass
+                try:
+                    cache._update_host_leaf_status(node)
+                except Exception:
+                    pass
+                try:
+                    cache._update_leaf_status(parent)
+                except Exception:
+                    pass
             else:
                 # 2) Try host backup first. If host is full, optionally evict
                 #    some host-only cache deterministically.
@@ -799,6 +813,18 @@ def _kvcached_evict_pages_for_shrink_impl(cache, target_num_pages: int) -> int:
                     except Exception:
                         pass
                     node.value = None
+                    try:
+                        cache._update_leaf_status(node)
+                    except Exception:
+                        pass
+                    try:
+                        cache._update_host_leaf_status(node)
+                    except Exception:
+                        pass
+                    try:
+                        cache._update_leaf_status(parent)
+                    except Exception:
+                        pass
                 else:
                     # 3) Shrink success first: drop subtree.
                     # Avoid deleting if there are protected host nodes in the subtree.
