@@ -173,7 +173,7 @@ class KVCacheManager:
         """
         self._wait_post_init()
         new_mem_size = self.page_allocator.mem_info_tracker.check_and_get_resize_target(
-            self.mem_size, self.num_layers
+            self.mem_size, self.num_layers, self.num_kv_buffers
         )
         if new_mem_size is None:
             return False

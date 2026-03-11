@@ -30,22 +30,38 @@ def _kvcached_evict_pages_for_shrink_impl(cache, target_num_pages: int) -> int:
 
     Goal: free whole kvcached physical pages to satisfy shrink.
 
-    Strategy (page-aware + lock-aware + host-friendly):
+    Strategy (page-aware + lock-aware + host-friendly + TP-safe):
       1) Identify "fully releasable" pages: pages fully covered by device-resident
          radix nodes and without any blocks belonging to locked nodes (lock_ref > 0).
       2) If there are more fully releasable pages than needed, choose the subset
          with the lowest eviction cost (estimated by subtree token count).
          Otherwise, evict all fully releasable pages.
-      3) Evict nodes in the selected subtrees in a deterministic device-postorder:
-           - If a node is already backuped (host_value exists), evict device blocks
-             and keep the node (value=None) so host cache remains usable.
-           - Otherwise, try to back up device blocks to host first, then evict.
-           - If host backup is not possible, fall back to deleting the node (and
-             dropping any host-only descendants) to prioritize shrink success.
+      3) Evict nodes in wave-based batches with TP synchronization:
+           - Each wave: pop all current leaf candidates from the heap, attempt
+             host backup locally (per-rank), then synchronize backup success via
+             all_reduce(MIN) across TP ranks.
+           - If ALL ranks succeeded: evict device blocks and keep the node as
+             host-backed (value=None, host_value set).
+           - If ANY rank failed: ALL ranks delete the node (rollback any
+             successful backup first) to keep tree structure identical.
+           - Parents exposed as new leaves are pushed to the heap for the next
+             wave.
+
+    TP determinism:
+      - Host backup is per-rank (host memory is independent), so backup
+        success/failure can differ across ranks. Without synchronization this
+        causes tree-structure divergence, inconsistent match_prefix results,
+        divergent block allocations, and eventual deadlock.
+      - The wave + all_reduce(MIN) pattern ensures every keep-vs-delete
+        decision is identical across all TP ranks, at the cost of one
+        all_reduce per wave (typically 1-2 waves per round).
+      - prefer_evict_host=False is used during backup attempts to prevent
+        _evict_host_deterministic from making per-rank tree mutations.
+      - When tp_size == 1 no distributed communication is performed.
 
     Notes:
       - Best-effort and time-bounded.
-      - Determinism matters for TP: all ordering uses block-id-derived keys.
+      - All ordering uses block-id-derived keys for cross-rank stability.
       - Never leave a node as evicted-but-not-backuped in the tree (it breaks
         HiRadixCache.match_prefix assumptions).
     """
@@ -73,6 +89,11 @@ def _kvcached_evict_pages_for_shrink_impl(cache, target_num_pages: int) -> int:
 
     block_mem_size = int(allocator.block_mem_size)
     rank = _safe_rank()
+
+    # TP synchronization: when tp_size > 1, backup success/failure must be
+    # coordinated across ranks to keep the radix tree structure identical.
+    tp_size = int(getattr(cache, "tp_world_size", 1) or 1)
+    tp_group = getattr(cache, "tp_group", None) if tp_size > 1 else None
 
     # Time budget and multi-round loop are defensive: freeing may be partial due
     # to internal fragmentation and/or eviction constraints.
@@ -523,290 +544,427 @@ def _kvcached_evict_pages_for_shrink_impl(cache, target_num_pages: int) -> int:
                 except Exception:
                     pass
 
+    def _rollback_host_backup(node: Any) -> None:
+        """Undo a host backup that was made during this shrink wave.
+
+        When TP consensus decides to DELETE a node but this rank successfully
+        backed it up, we must free the host allocation to avoid leaks.
+        """
+        hv = getattr(node, "host_value", None)
+        if hv is None:
+            return
+        cc = getattr(cache, "cache_controller", None)
+        if cc is not None:
+            try:
+                cc.mem_pool_host.free(hv)
+            except Exception:
+                pass
+        try:
+            node.host_value = None
+        except Exception:
+            pass
+
     total_freed_pages = 0
     for round_idx in range(max_rounds):
         round_start = time.perf_counter()
+        skip_round = False
+
         if _time_exceeded():
-            break
+            skip_round = True
 
-        before_inuse = int(page_allocator.get_num_inuse_pages())
-        if before_inuse <= int(target_num_pages):
-            break
+        before_inuse = 0
+        if not skip_round:
+            before_inuse = int(page_allocator.get_num_inuse_pages())
+            if before_inuse <= int(target_num_pages):
+                skip_round = True
 
-        pages_needed = before_inuse - int(target_num_pages)
-        allocated_by_page = _get_allocated_by_page()
-        if not allocated_by_page:
-            break
+        pages_needed = 0
+        allocated_by_page: dict[int, int] = {}
+        if not skip_round:
+            pages_needed = before_inuse - int(target_num_pages)
+            allocated_by_page = _get_allocated_by_page()
+            if not allocated_by_page:
+                skip_round = True
 
-        postorder_nodes = _iter_nodes_postorder_device()
-        if not postorder_nodes:
-            break
+        postorder_nodes: list[Any] = []
+        if not skip_round:
+            postorder_nodes = _iter_nodes_postorder_device()
+            if not postorder_nodes:
+                skip_round = True
 
         # Compute subtree token count and "contains locked node" flags.
         subtree_tokens: dict[Any, int] = {}
         subtree_has_lock: dict[Any, bool] = {}
-        for node in postorder_nodes:
-            total = _node_token_len(node)
-            has_lock = int(getattr(node, "lock_ref", 0) or 0) > 0
+        if not skip_round:
+            for node in postorder_nodes:
+                total = _node_token_len(node)
+                has_lock = int(getattr(node, "lock_ref", 0) or 0) > 0
 
-            children = getattr(node, "children", None)
-            if isinstance(children, dict):
-                child_nodes = children.values()
-            elif children is not None:
-                try:
-                    child_nodes = list(children)
-                except Exception:
+                children = getattr(node, "children", None)
+                if isinstance(children, dict):
+                    child_nodes = children.values()
+                elif children is not None:
+                    try:
+                        child_nodes = list(children)
+                    except Exception:
+                        child_nodes = []
+                else:
                     child_nodes = []
-            else:
-                child_nodes = []
 
-            for child in child_nodes:
-                # Only device-resident children participate in device shrink.
-                if getattr(child, "value", None) is None:
-                    continue
-                total += int(subtree_tokens.get(child, 0))
-                if subtree_has_lock.get(child, False):
-                    has_lock = True
+                for child in child_nodes:
+                    if getattr(child, "value", None) is None:
+                        continue
+                    total += int(subtree_tokens.get(child, 0))
+                    if subtree_has_lock.get(child, False):
+                        has_lock = True
 
-            subtree_tokens[node] = int(total)
-            subtree_has_lock[node] = bool(has_lock)
-            if _time_exceeded():
-                break
-        if _time_exceeded():
-            break
+                subtree_tokens[node] = int(total)
+                subtree_has_lock[node] = bool(has_lock)
+                if _time_exceeded():
+                    skip_round = True
+                    break
 
         # Compute per-page coverage and locked pages.
         locked_pages: set[int] = set()
         known_blocks_by_page: dict[int, int] = defaultdict(int)
         nodes_by_page: dict[int, list[Any]] = defaultdict(list)
-        for node in postorder_nodes:
-            info = _get_node_info(node)
-            if info is None:
-                continue
-            _num_blocks, counts, _sort_key, _tie64 = info
-            if not counts:
-                continue
-
-            lock_ref = int(getattr(node, "lock_ref", 0) or 0)
-            for pid, cnt in counts.items():
-                if pid not in allocated_by_page:
+        if not skip_round:
+            for node in postorder_nodes:
+                info = _get_node_info(node)
+                if info is None:
                     continue
-                known_blocks_by_page[int(pid)] += int(cnt)
-                if lock_ref > 0:
-                    locked_pages.add(int(pid))
-                else:
-                    nodes_by_page[int(pid)].append(node)
-            if _time_exceeded():
-                break
-        if _time_exceeded():
-            break
+                _num_blocks, counts, _sort_key, _tie64 = info
+                if not counts:
+                    continue
+
+                lock_ref = int(getattr(node, "lock_ref", 0) or 0)
+                for pid, cnt in counts.items():
+                    if pid not in allocated_by_page:
+                        continue
+                    known_blocks_by_page[int(pid)] += int(cnt)
+                    if lock_ref > 0:
+                        locked_pages.add(int(pid))
+                    else:
+                        nodes_by_page[int(pid)].append(node)
+                if _time_exceeded():
+                    skip_round = True
+                    break
 
         # Exclude pages that contain pinned blocks (e.g., reserved null block).
         excluded_pages: set[int] = set()
-        null_block = getattr(allocator, "null_block", None)
-        if null_block:
-            try:
-                null_pid = int(page_allocator.get_page_id(int(null_block[0]), block_mem_size))
-                excluded_pages.add(null_pid)
-            except Exception:
-                pass
-
         candidate_pages: list[tuple[int, int, int, list[Any]]] = []
-        for pid, allocated in allocated_by_page.items():
-            if pid in excluded_pages or pid in locked_pages:
-                continue
-            if known_blocks_by_page.get(pid, 0) < int(allocated):
-                continue
+        if not skip_round:
+            null_block = getattr(allocator, "null_block", None)
+            if null_block:
+                try:
+                    null_pid = int(page_allocator.get_page_id(int(null_block[0]), block_mem_size))
+                    excluded_pages.add(null_pid)
+                except Exception:
+                    pass
 
-            page_nodes = nodes_by_page.get(pid)
-            if not page_nodes:
-                continue
+            for pid, allocated in allocated_by_page.items():
+                if pid in excluded_pages or pid in locked_pages:
+                    continue
+                if known_blocks_by_page.get(pid, 0) < int(allocated):
+                    continue
 
-            page_nodes_set = set(page_nodes)
-            roots: list[Any] = []
-            for node in page_nodes_set:
-                p = getattr(node, "parent", None)
+                page_nodes = nodes_by_page.get(pid)
+                if not page_nodes:
+                    continue
+
+                page_nodes_set = set(page_nodes)
+                roots: list[Any] = []
+                for node in page_nodes_set:
+                    p = getattr(node, "parent", None)
+                    while p is not None and p != getattr(cache, "root_node", None):
+                        if p in page_nodes_set:
+                            break
+                        p = getattr(p, "parent", None)
+                    else:
+                        roots.append(node)
+
+                if not roots:
+                    continue
+                if any(subtree_has_lock.get(r, False) for r in roots):
+                    continue
+
+                roots.sort(
+                    key=lambda n: (
+                        (_get_node_info(n) or (0, {}, (), 0))[2],
+                        (_get_node_info(n) or (0, {}, (), 0))[3],
+                    )
+                )
+
+                cost_tokens = 0
+                for r in roots:
+                    cost_tokens += int(subtree_tokens.get(r, 0))
+
+                candidate_pages.append((int(cost_tokens), int(allocated), int(pid), roots))
+                if _time_exceeded():
+                    skip_round = True
+                    break
+
+            if not candidate_pages:
+                skip_round = True
+
+        selected_pages_set: set[int] = set()
+        remaining: dict[int, int] = {}
+        in_target: set[Any] = set()
+        candidates: list[tuple[tuple[int, ...], int, Any]] = []
+        pushed: set[Any] = set()
+
+        if not skip_round:
+            candidate_pages.sort(key=lambda t: (t[0], t[1], t[2]))
+            selected = candidate_pages[:pages_needed] if len(candidate_pages) >= pages_needed else candidate_pages
+            selected_pages = [t[2] for t in selected]
+            selected_pages_set = set(selected_pages)
+            remaining = {pid: int(allocated_by_page[pid]) for pid in selected_pages}
+
+            # De-duplicate ancestor/descendant overlaps.
+            selected_roots_set: set[Any] = set()
+            for _cost, _allocated, _pid, roots in selected:
+                selected_roots_set.update(roots)
+
+            def _depth(node: Any) -> int:
+                d = 0
+                p = node
+                root = getattr(cache, "root_node", None)
+                while p is not None and p != root:
+                    d += 1
+                    p = getattr(p, "parent", None)
+                return d
+
+            roots_sorted = sorted(
+                selected_roots_set,
+                key=lambda n: (
+                    _depth(n),
+                    (_get_node_info(n) or (0, {}, (), 0))[2],
+                    (_get_node_info(n) or (0, {}, (), 0))[3],
+                ),
+            )
+            minimal_set: set[Any] = set()
+            for r in roots_sorted:
+                p = getattr(r, "parent", None)
                 while p is not None and p != getattr(cache, "root_node", None):
-                    if p in page_nodes_set:
+                    if p in minimal_set:
                         break
                     p = getattr(p, "parent", None)
                 else:
-                    roots.append(node)
+                    minimal_set.add(r)
 
-            if not roots:
-                continue
-            if any(subtree_has_lock.get(r, False) for r in roots):
-                continue
+            device_leaves: list[Any] = []
+            stack2: list[Any] = list(minimal_set)
+            while stack2:
+                node = stack2.pop()
+                if node is None or node in in_target:
+                    continue
+                if getattr(node, "value", None) is None:
+                    continue
+                in_target.add(node)
 
-            roots.sort(
-                key=lambda n: (
-                    (_get_node_info(n) or (0, {}, (), 0))[2],
-                    (_get_node_info(n) or (0, {}, (), 0))[3],
-                )
+                children = getattr(node, "children", None)
+                child_list: list[Any] = []
+                if isinstance(children, dict):
+                    items = list(children.items())
+                    items.sort(key=lambda kv: _stable_child_key(kv[0]))
+                    child_list = [c for _k, c in items]
+                elif children is not None:
+                    try:
+                        child_list = list(children)
+                    except Exception:
+                        child_list = []
+                    child_list.sort(key=lambda c: (type(c).__name__, repr(c)))
+
+                has_device_child = False
+                for child in child_list:
+                    if getattr(child, "value", None) is not None:
+                        has_device_child = True
+                        stack2.append(child)
+
+                if not has_device_child and _is_device_leaf(node):
+                    device_leaves.append(node)
+
+            def _push(node: Any) -> None:
+                if node in pushed:
+                    return
+                if node not in in_target:
+                    return
+                if int(getattr(node, "lock_ref", 1) or 0) != 0:
+                    return
+                if not _is_device_leaf(node):
+                    return
+                info = _get_node_info(node)
+                if info is None:
+                    return
+                _num_blocks, _counts, sort_key, tie64 = info
+                heapq.heappush(candidates, (sort_key, tie64, node))
+                pushed.add(node)
+
+            for node in device_leaves:
+                _push(node)
+
+        # --- TP-synced gate: all ranks must agree to enter the wave loop ---
+        # Without this gate, one rank could skip candidate building (due to
+        # time budget or structural differences) while the other proceeds to
+        # wave-loop all_reduce calls, causing a collective mismatch deadlock.
+        if tp_size > 1 and tp_group is not None:
+            _can_enter = torch.tensor(
+                [0 if skip_round else 1], dtype=torch.int32, device="cpu"
             )
-
-            cost_tokens = 0
-            for r in roots:
-                cost_tokens += int(subtree_tokens.get(r, 0))
-
-            candidate_pages.append((int(cost_tokens), int(allocated), int(pid), roots))
-            if _time_exceeded():
+            torch.distributed.all_reduce(
+                _can_enter, op=torch.distributed.ReduceOp.MIN, group=tp_group
+            )
+            if int(_can_enter.item()) == 0:
+                if not skip_round:
+                    logger.debug(
+                        f"[hi-shrink-evict] rank={rank} round={round_idx} "
+                        f"skipped by TP gate (peer not ready)"
+                    )
                 break
-        if _time_exceeded():
+        elif skip_round:
             break
-
-        if not candidate_pages:
-            break
-
-        candidate_pages.sort(key=lambda t: (t[0], t[1], t[2]))
-        selected = candidate_pages[:pages_needed] if len(candidate_pages) >= pages_needed else candidate_pages
-        selected_pages = [t[2] for t in selected]
-        selected_pages_set = set(selected_pages)
-        remaining: dict[int, int] = {pid: int(allocated_by_page[pid]) for pid in selected_pages}
-
-        # De-duplicate ancestor/descendant overlaps.
-        selected_roots_set: set[Any] = set()
-        for _cost, _allocated, _pid, roots in selected:
-            selected_roots_set.update(roots)
-
-        def _depth(node: Any) -> int:
-            d = 0
-            p = node
-            root = getattr(cache, "root_node", None)
-            while p is not None and p != root:
-                d += 1
-                p = getattr(p, "parent", None)
-            return d
-
-        roots_sorted = sorted(
-            selected_roots_set,
-            key=lambda n: (
-                _depth(n),
-                (_get_node_info(n) or (0, {}, (), 0))[2],
-                (_get_node_info(n) or (0, {}, (), 0))[3],
-            ),
-        )
-        minimal_set: set[Any] = set()
-        for r in roots_sorted:
-            p = getattr(r, "parent", None)
-            while p is not None and p != getattr(cache, "root_node", None):
-                if p in minimal_set:
-                    break
-                p = getattr(p, "parent", None)
-            else:
-                minimal_set.add(r)
-
-        # Traverse selected subtrees (device nodes only) and collect initial device-leaves.
-        in_target: set[Any] = set()
-        device_leaves: list[Any] = []
-        stack2: list[Any] = list(minimal_set)
-        while stack2:
-            node = stack2.pop()
-            if node is None or node in in_target:
-                continue
-            if getattr(node, "value", None) is None:
-                continue
-            in_target.add(node)
-
-            children = getattr(node, "children", None)
-            child_list: list[Any] = []
-            if isinstance(children, dict):
-                items = list(children.items())
-                items.sort(key=lambda kv: _stable_child_key(kv[0]))
-                child_list = [c for _k, c in items]
-            elif children is not None:
-                try:
-                    child_list = list(children)
-                except Exception:
-                    child_list = []
-                child_list.sort(key=lambda c: (type(c).__name__, repr(c)))
-
-            has_device_child = False
-            for child in child_list:
-                if getattr(child, "value", None) is not None:
-                    has_device_child = True
-                    stack2.append(child)
-
-            if not has_device_child and _is_device_leaf(node):
-                device_leaves.append(node)
-
-        pushed: set[Any] = set()
-        candidates: list[tuple[tuple[int, ...], int, Any]] = []
-
-        def _push(node: Any) -> None:
-            if node in pushed:
-                return
-            if node not in in_target:
-                return
-            if int(getattr(node, "lock_ref", 1) or 0) != 0:
-                return
-            if not _is_device_leaf(node):
-                return
-            info = _get_node_info(node)
-            if info is None:
-                return
-            _num_blocks, _counts, sort_key, tie64 = info
-            heapq.heappush(candidates, (sort_key, tie64, node))
-            pushed.add(node)
-
-        for node in device_leaves:
-            _push(node)
 
         num_nodes_evicted = 0
         pending_free: list[torch.Tensor] = []
+        root_node = getattr(cache, "root_node", None)
 
-        # Prefer eviction patterns that keep host cache. Host backup is done
-        # synchronously per-node (only for nodes we actually evict).
-        while remaining and candidates and not _time_exceeded():
-            _sort_key, _tie64, node = heapq.heappop(candidates)
-
-            if node not in in_target:
-                continue
-            if int(getattr(node, "lock_ref", 1) or 0) != 0:
-                continue
-            if not _is_device_leaf(node):
-                continue
-
-            parent = getattr(node, "parent", None)
-            if parent is None:
-                continue
-
-            info = _get_node_info(node)
-            if info is None:
-                continue
-            _num_blocks, counts, _sort_key2, _tie64b = info
-
-            val = getattr(node, "value", None)
-            if val is None:
-                continue
-
-            # 1) Keep host cache when possible.
-            if getattr(node, "host_value", None) is not None:
-                pending_free.append(val)
-                try:
-                    cache.evictable_size_ -= int(len(val))
-                except Exception:
-                    pass
-                node.value = None
-                # Keep internal eviction sets consistent with SGLang's
-                # HiRadixCache._evict_backuped semantics.
-                try:
-                    cache._update_leaf_status(node)
-                except Exception:
-                    pass
-                try:
-                    cache._update_host_leaf_status(node)
-                except Exception:
-                    pass
-                try:
-                    cache._update_leaf_status(parent)
-                except Exception:
-                    pass
+        # Wave-based eviction with TP synchronization.
+        #
+        # Each wave: drain current heap → try host backup locally →
+        # all_reduce(MIN) for TP consensus → execute keep/delete uniformly.
+        # Within a wave, newly exposed parents are pushed to the heap for
+        # the next wave. This guarantees identical tree mutations across
+        # TP ranks because every keep-vs-delete decision is agreed upon.
+        while True:
+            # TP-synced wave continuation: all ranks agree to proceed.
+            if tp_size > 1 and tp_group is not None:
+                _want_wave = int(
+                    bool(remaining) and bool(candidates) and not _time_exceeded()
+                )
+                _wave_sync = torch.tensor(
+                    [_want_wave], dtype=torch.int32, device="cpu"
+                )
+                torch.distributed.all_reduce(
+                    _wave_sync,
+                    op=torch.distributed.ReduceOp.MIN,
+                    group=tp_group,
+                )
+                if int(_wave_sync.item()) == 0:
+                    break
             else:
-                # 2) Try host backup first. If host is full, optionally evict
-                #    some host-only cache deterministically.
-                backed = _try_backup_to_host(node, prefer_evict_host=True)
-                if backed:
+                if not remaining or not candidates or _time_exceeded():
+                    break
+            # --- Pop all current candidates into a deterministic wave ---
+            wave_nodes: list[Any] = []
+            while candidates:
+                _sort_key, _tie64, node = heapq.heappop(candidates)
+                if node not in in_target:
+                    continue
+                if int(getattr(node, "lock_ref", 1) or 0) != 0:
+                    continue
+                if not _is_device_leaf(node):
+                    continue
+                if getattr(node, "parent", None) is None:
+                    continue
+                if _get_node_info(node) is None:
+                    continue
+                if getattr(node, "value", None) is None:
+                    continue
+                wave_nodes.append(node)
+            # Do NOT break when wave_nodes is empty: other TP ranks may have
+            # non-empty waves.  Phase 2 handles the size mismatch via the
+            # counts all_reduce; the next wave gate will exit because
+            # candidates is now drained.
+
+            # --- Phase 1: local backup attempt (per-rank) ---
+            # Use prefer_evict_host=False to avoid _evict_host_deterministic
+            # which mutates the tree in a per-rank manner.
+            local_flags: list[int] = []
+            newly_backed: list[bool] = []
+            for node in wave_nodes:
+                if getattr(node, "host_value", None) is not None:
+                    local_flags.append(1)
+                    newly_backed.append(False)
+                else:
+                    backed = _try_backup_to_host(node, prefer_evict_host=False)
+                    local_flags.append(1 if backed else 0)
+                    newly_backed.append(backed)
+
+            # --- Phase 2: TP consensus via all_reduce(MIN) ---
+            if tp_size > 1 and tp_group is not None:
+                # First, verify all ranks have the same wave size. If the
+                # tree has already diverged (e.g. from a prior unsynchronized
+                # shrink), wave_nodes lengths may differ and a direct
+                # all_reduce on the flags tensor would crash.
+                local_count = len(local_flags)
+                counts_tensor = torch.tensor(
+                    [local_count, local_count], dtype=torch.int32, device="cpu"
+                )
+                torch.distributed.all_reduce(
+                    counts_tensor,
+                    op=torch.distributed.ReduceOp.MIN,
+                    group=tp_group,
+                )
+                counts_tensor[1] = local_count
+                torch.distributed.all_reduce(
+                    counts_tensor,
+                    op=torch.distributed.ReduceOp.MAX,
+                    group=tp_group,
+                )
+                min_count = int(counts_tensor[0].item())
+                max_count = int(counts_tensor[1].item())
+
+                if min_count == max_count and min_count > 0:
+                    # All ranks agree on wave size — safe to all_reduce.
+                    flags_tensor = torch.tensor(
+                        local_flags, dtype=torch.int32, device="cpu"
+                    )
+                    torch.distributed.all_reduce(
+                        flags_tensor,
+                        op=torch.distributed.ReduceOp.MIN,
+                        group=tp_group,
+                    )
+                    consensus = flags_tensor.tolist()
+                elif min_count == max_count:
+                    # All ranks have empty waves — nothing to do.
+                    consensus = []
+                else:
+                    # Wave size mismatch: tree already diverged across ranks.
+                    # Fall back to always-delete so every rank removes its
+                    # local nodes, which drives trees back toward convergence.
+                    if rank == 0:
+                        logger.warning(
+                            f"[hi-shrink-evict] TP wave size mismatch "
+                            f"(min={min_count} max={max_count} "
+                            f"local={local_count}). "
+                            f"Falling back to always-delete."
+                        )
+                    consensus = [0] * local_count
+                    for idx in range(local_count):
+                        if newly_backed[idx]:
+                            _rollback_host_backup(wave_nodes[idx])
+                    newly_backed = [False] * local_count
+            else:
+                consensus = local_flags
+
+            # --- Phase 3: execute decisions uniformly across ranks ---
+            wave_keep = 0
+            wave_delete = 0
+            for idx, node in enumerate(wave_nodes):
+                if not remaining:
+                    break
+                keep = int(consensus[idx]) == 1
+                parent = getattr(node, "parent", None)
+                info = _get_node_info(node)
+                if info is None:
+                    continue
+                _num_blocks, counts, _sort_key2, _tie64b = info
+                val = getattr(node, "value", None)
+                if val is None:
+                    continue
+
+                if keep:
+                    # All ranks agree: evict device, keep host-backed node.
                     pending_free.append(val)
                     try:
                         cache.evictable_size_ -= int(len(val))
@@ -825,9 +983,12 @@ def _kvcached_evict_pages_for_shrink_impl(cache, target_num_pages: int) -> int:
                         cache._update_leaf_status(parent)
                     except Exception:
                         pass
+                    wave_keep += 1
                 else:
-                    # 3) Shrink success first: drop subtree.
-                    # Avoid deleting if there are protected host nodes in the subtree.
+                    # All ranks agree: delete subtree.
+                    # Always free node's own host_value (covers both newly-backed
+                    # and pre-existing backups) to prevent host memory leaks.
+                    _rollback_host_backup(node)
                     if _subtree_has_protected_host(node):
                         continue
                     _free_host_subtree(node)
@@ -836,31 +997,30 @@ def _kvcached_evict_pages_for_shrink_impl(cache, target_num_pages: int) -> int:
                         cache._delete_leaf(node)
                         cache._record_remove_event(node)
                     except Exception:
-                        # Best-effort.
                         try:
                             cache._delete_leaf(node)
                         except Exception:
                             pass
+                    wave_delete += 1
 
-            num_nodes_evicted += 1
+                num_nodes_evicted += 1
+                for pid, cnt in counts.items():
+                    if pid in remaining:
+                        remaining[pid] -= int(cnt)
+                        if remaining[pid] <= 0:
+                            del remaining[pid]
 
-            for pid, cnt in counts.items():
-                if pid in remaining:
-                    remaining[pid] -= int(cnt)
-                    if remaining[pid] <= 0:
-                        del remaining[pid]
-
-            # Push parents that become device-leaves.
-            p = parent
-            while (
-                p is not None
-                and p != getattr(cache, "root_node", None)
-                and p in in_target
-                and int(getattr(p, "lock_ref", 1) or 0) == 0
-                and _is_device_leaf(p)
-            ):
-                _push(p)
-                p = getattr(p, "parent", None)
+                # Push parents that become device-leaves for next wave.
+                p = parent
+                while (
+                    p is not None
+                    and p != root_node
+                    and p in in_target
+                    and int(getattr(p, "lock_ref", 1) or 0) == 0
+                    and _is_device_leaf(p)
+                ):
+                    _push(p)
+                    p = getattr(p, "parent", None)
 
         free_ms = 0.0
         if pending_free:
@@ -890,7 +1050,17 @@ def _kvcached_evict_pages_for_shrink_impl(cache, target_num_pages: int) -> int:
                 f"round_ms={(time.perf_counter() - round_start) * 1000:.1f}"
             )
 
-        if freed <= 0 and num_nodes_evicted == 0:
+        # TP-synced end-of-round: all ranks must agree to continue.
+        _should_next = int(freed > 0 or num_nodes_evicted > 0)
+        if tp_size > 1 and tp_group is not None:
+            _next_gate = torch.tensor(
+                [_should_next], dtype=torch.int32, device="cpu"
+            )
+            torch.distributed.all_reduce(
+                _next_gate, op=torch.distributed.ReduceOp.MIN, group=tp_group
+            )
+            _should_next = int(_next_gate.item())
+        if not _should_next:
             break
         total_freed_pages += int(freed)
 
@@ -1020,6 +1190,63 @@ class HiRadixCacheShrinkEvictionPatch(VersionAwarePatch, BasePatch):
 
             self._mark_as_patched(_wrapped_writing_check)
             setattr(HiRadixCache, "writing_check", _wrapped_writing_check)
+
+        # Patch evict_host to prevent per-rank tree mutations under TP.
+        #
+        # evict_host() is called from write_backup() and prefetch() when host
+        # memory is full.  It frees host memory by *removing* host-only nodes
+        # from the tree (parent.children.pop).  Because host memory capacity
+        # and allocation timing are per-rank, different TP ranks may evict
+        # different sets of host-only nodes, causing the radix tree structure
+        # to diverge.  Once diverged, subsequent shrink operations see
+        # mismatched candidate sets and wave sizes.
+        #
+        # Fix: when tp_size > 1, skip evict_host entirely.  This means that
+        # when host memory is full, write_backup() fails gracefully (returns
+        # 0) and the node simply does not get a host backup.  Host memory is
+        # still freed during synchronized shrink (DELETE path frees host_value
+        # via _rollback_host_backup / _free_host_subtree).
+        original_evict_host = getattr(HiRadixCache, "evict_host", None)
+        if original_evict_host is not None and not self._is_already_patched(original_evict_host):
+
+            def _wrapped_evict_host(self, num_tokens: int):
+                tp_size = int(getattr(self, "tp_world_size", 1) or 1)
+                if tp_size > 1:
+                    return
+                return original_evict_host(self, num_tokens)
+
+            self._mark_as_patched(_wrapped_evict_host)
+            setattr(HiRadixCache, "evict_host", _wrapped_evict_host)
+
+        # Patch write_backup to skip async write-through under TP.
+        #
+        # write_backup() is called from _inc_hit_count() during insert() when
+        # a node's hit_count exceeds the write-through threshold.  It allocates
+        # host memory via cache_controller.write().  Because host memory
+        # capacity and fragmentation are per-rank, one rank may succeed while
+        # another fails.  A successful write sets node.host_value, adds the
+        # node to ongoing_write_through, and calls inc_lock_ref — none of
+        # which happen on the failing rank.  The resulting lock_ref divergence
+        # makes different nodes evictable on different ranks, gradually
+        # causing tree structure divergence and wave-size mismatches during
+        # subsequent shrinks.
+        #
+        # Fix: when tp_size > 1 and write_back=False (async write-through),
+        # skip the write entirely.  write_back=True (explicit write-back
+        # policy path from evict()) is still allowed.  The shrink path uses
+        # _try_backup_to_host which calls cache_controller.write() directly
+        # and is unaffected by this patch.
+        original_write_backup = getattr(HiRadixCache, "write_backup", None)
+        if original_write_backup is not None and not self._is_already_patched(original_write_backup):
+
+            def _wrapped_write_backup(self, node, write_back=False):
+                tp_size = int(getattr(self, "tp_world_size", 1) or 1)
+                if tp_size > 1 and not write_back:
+                    return 0
+                return original_write_backup(self, node, write_back=write_back)
+
+            self._mark_as_patched(_wrapped_write_backup)
+            setattr(HiRadixCache, "write_backup", _wrapped_write_backup)
 
         self._mark_as_patched(HiRadixCache, "__kvcached_hiradix_shrink_eviction__")
         return True
